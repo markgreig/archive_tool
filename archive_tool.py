@@ -2,8 +2,14 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
+import sys
 
-import pyperclip
+# Try to import pyperclip, handle if missing
+try:
+    import pyperclip
+except ImportError:
+    pyperclip = None
+
 from playwright.async_api import (
     BrowserContext,
     Page,
@@ -11,8 +17,9 @@ from playwright.async_api import (
     async_playwright,
 )
 
+# Using .is or .li often works better as a base, but .ph is the main hub.
+# Redirects happen automatically.
 ARCHIVE_URL = "https://archive.ph/"
-
 
 @dataclass
 class SubmissionResult:
@@ -21,67 +28,74 @@ class SubmissionResult:
     detail: str
     active_page: Page
 
-
 async def prompt_for_captcha_resolution(page: Page) -> None:
     """
-    If a captcha is present, pause execution until the user confirms it has been solved.
-    The function searches for common captcha iframe patterns and only prompts when
-    necessary to avoid unnecessary blocking.
+    Checks for common captcha/challenge indicators. If found, pauses execution
+    and waits for the user to solve it in the browser.
     """
-
+    # Common Cloudflare or Google Recaptcha frames/divs
     captcha_locators = [
         "iframe[src*='captcha']",
-        "iframe[src*='hcaptcha']",
-        "iframe[src*='recaptcha']",
-        "div#cf-challenge-running",
+        "iframe[src*='turnstile']",
+        "iframe[src*='challenge']",
+        "#cf-challenge-running", 
+        "text='One more step'",
+        "text='Verify you are human'"
     ]
+
+    detected = False
     for locator in captcha_locators:
-        if await page.locator(locator).count() > 0:
-            print("Captcha detected. Please complete it in the browser window.")
-            await asyncio.to_thread(input, "Press Enter after solving the captcha...")
-            break
-
-
-async def wait_for_result_navigation(
-    context: BrowserContext, page: Page, starting_url: str, timeout: float
-) -> tuple[Optional[str], Page]:
-    """
-    Wait for either the current page to navigate away from the starting URL or for a
-    new page to open. Returns the resulting URL (if any) and the active page object
-    that contains that URL.
-    """
-
-    navigation_task = asyncio.create_task(
-        page.wait_for_url(lambda url: url != starting_url, timeout=timeout)
-    )
-    new_page_task = asyncio.create_task(context.wait_for_event("page", timeout=timeout))
-
-    done, pending = await asyncio.wait(
-        {navigation_task, new_page_task}, return_when=asyncio.FIRST_COMPLETED
-    )
-
-    result_url: Optional[str] = None
-    active_page = page
-
-    for task in done:
         try:
-            result = task.result()
-            if result is None:
-                if page.url != starting_url:
-                    result_url = page.url
-            elif hasattr(result, "url"):
-                # context.wait_for_event("page") returns a Page
-                active_page = result
-                await active_page.wait_for_load_state("networkidle")
-                result_url = active_page.url
-        except PlaywrightTimeoutError:
-            pass
+            count = await page.locator(locator).count()
+            if count > 0:
+                detected = True
+                break
+        except Exception:
+            continue
 
-    for task in pending:
-        task.cancel()
+    if detected:
+        print("\n" + "!" * 60)
+        print("CAPTCHA DETECTED!")
+        print("Please switch to the browser window, solve the puzzle,")
+        print("and wait for the page to load normally.")
+        print("!" * 60 + "\n")
+        
+        # In a real GUI environment, we just wait for the user to press Enter in terminal
+        await asyncio.to_thread(input, ">> Press ENTER in this terminal AFTER solving the captcha... ")
+        
+        # Wait a moment for page to stabilize after user input
+        await page.wait_for_timeout(2000)
 
-    return result_url, active_page
+async def handle_wip_page(page: Page, timeout: float) -> str:
+    """
+    Archive.ph redirects to a /wip/ (work in progress) URL while processing.
+    We must wait for this to change to the final timestamped URL.
+    """
+    print("Processing (WIP) page detected. Waiting for archive to finish...")
+    print("This can take 1-5 minutes. Please be patient.")
 
+    start_time = asyncio.get_running_loop().time()
+    
+    while True:
+        current_url = page.url
+        
+        # If we are no longer on a WIP page and not on the home page, we are likely done
+        if "/wip/" not in current_url and "submitid" not in current_url and current_url != ARCHIVE_URL:
+             # Double check: does the page look like a finished archive?
+             # Usually contains a header with the date or "share" buttons
+             return current_url
+
+        # Check for failure text
+        content = await page.content()
+        if "No results" in content and "search" in current_url:
+            return None # Search failed
+
+        if (asyncio.get_running_loop().time() - start_time) > timeout:
+            print("Timeout waiting for WIP page to finish.")
+            return current_url # Return whatever we have
+
+        # Wait 2 seconds before checking again
+        await asyncio.sleep(2)
 
 async def attempt_submission(
     context: BrowserContext,
@@ -93,40 +107,61 @@ async def attempt_submission(
 ) -> SubmissionResult:
     starting_url = page.url
 
+    # Find a working selector
+    target_selector = None
     for selector in selectors:
-        locator = page.locator(selector)
-        if await locator.count() == 0:
-            continue
+        if await page.locator(selector).count() > 0:
+            target_selector = selector
+            break
+    
+    if not target_selector:
+        return SubmissionResult(False, None, f"[{label}] No input box found.", page)
 
-        target = locator.first
-        print(f"[{label}] Using selector '{selector}' to submit the URL...")
+    print(f"[{label}] Submitting via '{target_selector}'...")
+    
+    try:
+        target = page.locator(target_selector).first
         await target.click()
         await target.fill(url_value)
         await target.press("Enter")
+    except Exception as e:
+        return SubmissionResult(False, None, f"Error interacting with page: {e}", page)
 
-        result_url, active_page = await wait_for_result_navigation(
-            context, page, starting_url, timeout
-        )
-        if result_url:
-            return SubmissionResult(
-                True, result_url, f"Navigated to {result_url} via {selector}", active_page
-            )
+    # 1. Wait for initial navigation (leaving the home page)
+    try:
+        await page.wait_for_url(lambda u: u != starting_url, timeout=15000)
+    except PlaywrightTimeoutError:
+        print(f"[{label}] Timed out waiting for initial form submission.")
+        return SubmissionResult(False, None, "Form submission timeout", page)
 
-        print(f"[{label}] No navigation detected with selector '{selector}'. Trying next.")
+    # 2. Check for Captcha immediately after submission
+    await prompt_for_captcha_resolution(page)
 
-    return SubmissionResult(False, None, "No matching selectors produced a result", page)
+    # 3. Handle "WIP" (Loading) Phase
+    # Archive.ph often goes: Home -> WIP -> Final
+    if "/wip/" in page.url or "submitid" in page.url:
+        final_url = await handle_wip_page(page, timeout)
+        if final_url:
+            return SubmissionResult(True, final_url, "Archived successfully via WIP", page)
+        else:
+             return SubmissionResult(False, page.url, "WIP finished but no valid URL found", page)
+
+    # 4. If we went straight to a result (rare but happens on cached hits)
+    await page.wait_for_load_state("domcontentloaded")
+    return SubmissionResult(True, page.url, "Direct navigation to result", page)
 
 
 def resolve_url_from_args_or_clipboard(provided: Optional[str]) -> str:
     if provided:
         return provided
-
-    url_from_clipboard = pyperclip.paste().strip()
-    if not url_from_clipboard:
-        raise ValueError("No URL provided and clipboard is empty.")
-
-    return url_from_clipboard
-
+    
+    if pyperclip:
+        url_from_clipboard = pyperclip.paste().strip()
+        if url_from_clipboard:
+            return url_from_clipboard
+            
+    print("Error: No URL provided and clipboard is empty (or pyperclip not installed).")
+    sys.exit(1)
 
 async def run_automation(
     target_url: str,
@@ -135,27 +170,52 @@ async def run_automation(
     primary_selectors: Sequence[str],
     fallback_selectors: Sequence[str],
 ) -> None:
+    
+    # Setup browser with anti-bot flags
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context()
+        # Launch options to make it look more 'human'
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"] 
+        )
+        
+        # Use a generic User-Agent to avoid immediate blocking
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
         page = await context.new_page()
 
         print(f"Opening {ARCHIVE_URL} ...")
-        await page.goto(ARCHIVE_URL)
+        try:
+            await page.goto(ARCHIVE_URL, timeout=30000)
+        except Exception as e:
+            print(f"Error loading {ARCHIVE_URL}: {e}")
+            await browser.close()
+            return
+
         await prompt_for_captcha_resolution(page)
 
+        # --- Attempt 1: New Archive (Red Box) ---
+        print("\n--- Attempting New Archive (Red Box) ---")
         primary_result = await attempt_submission(
             context, page, target_url, primary_selectors, timeout, label="primary"
         )
 
         if primary_result.succeeded:
-            print(f"Archive created or loaded: {primary_result.destination_url}")
-            if primary_result.active_page.url != primary_result.destination_url:
-                await primary_result.active_page.goto(primary_result.destination_url)
+            print("\n" + "="*60)
+            print(f"SUCCESS! Archive URL: {primary_result.destination_url}")
+            print("="*60 + "\n")
+            # Keep browser open briefly so user can see it if not headless
+            if not headless:
+                print("Leaving browser open for 10 seconds to view result...")
+                await asyncio.sleep(10)
             await browser.close()
             return
 
-        print("Primary submission did not yield a result. Trying fallback path...")
+        # --- Attempt 2: Search Existing (Black Box) ---
+        print("\n--- Primary failed. Attempting Search (Black Box) ---")
+        
+        # Reload home
         await page.goto(ARCHIVE_URL)
         await prompt_for_captcha_resolution(page)
 
@@ -164,71 +224,38 @@ async def run_automation(
         )
 
         if fallback_result.succeeded:
-            print(f"Fallback archive result: {fallback_result.destination_url}")
-            if fallback_result.active_page.url != fallback_result.destination_url:
-                await fallback_result.active_page.goto(fallback_result.destination_url)
+            print("\n" + "="*60)
+            print(f"SUCCESS (Found Existing): {fallback_result.destination_url}")
+            print("="*60 + "\n")
+            if not headless:
+                await asyncio.sleep(10)
         else:
-            print("Automation could not obtain a result URL from archive.ph.")
+            print("\nFAILED. Could not obtain a result URL.")
+            print(f"Last URL was: {fallback_result.destination_url}")
 
         await browser.close()
 
 
-def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Automate submitting a URL to archive.ph, waiting for a result, and "
-            "falling back to the secondary submission box when necessary."
-        )
-    )
-    parser.add_argument(
-        "url",
-        nargs="?",
-        help="URL to submit. If omitted, the clipboard contents will be used.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=180,
-        help="Seconds to wait for archive.ph to return a result before falling back.",
-    )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run the browser in headless mode (not recommended when captchas appear).",
-    )
-    parser.add_argument(
-        "--primary-selector",
-        action="append",
-        dest="primary_selectors",
-        help="Override the selectors used for the primary submission box.",
-    )
-    parser.add_argument(
-        "--fallback-selector",
-        action="append",
-        dest="fallback_selectors",
-        help="Override the selectors used for the fallback submission box.",
-    )
-    return parser
-
-
-def main(argv: Optional[Iterable[str]] = None) -> None:
-    parser = build_argument_parser()
-    args = parser.parse_args(argv)
-
+def main():
+    parser = argparse.ArgumentParser(description="Automate archive.ph submission.")
+    parser.add_argument("url", nargs="?", help="URL to submit.")
+    
+    # Increased default timeout to 300s (5 mins) because archiving is slow
+    parser.add_argument("--timeout", type=float, default=300, help="Wait timeout in seconds.")
+    
+    # Default is HEADED (visible) because captchas are likely
+    parser.add_argument("--headless", action="store_true", help="Run invisible (not recommended).")
+    
+    args = parser.parse_args()
     target_url = resolve_url_from_args_or_clipboard(args.url)
 
-    primary_selectors = (
-        args.primary_selectors
-        if args.primary_selectors
-        else ["form#submiturl input[name='url']", "input#submiturl", "input[name='url']"]
-    )
-    fallback_selectors = (
-        args.fallback_selectors
-        if args.fallback_selectors
-        else ["form#searchurl input[name='url']", "input#searchurl", "input[name='q']"]
-    )
+    # Refined Selectors based on current archive.ph layout
+    # "submiturl" is the red box (create new), "searchurl" is the black box (find existing)
+    primary_selectors = ["#submiturl input[name='url']", "#url", "input[name='url']"]
+    fallback_selectors = ["#searchurl input[name='url']", "input[name='search']", "#search"]
 
-    print(f"Submitting URL: {target_url}")
+    print(f"Target URL: {target_url}")
+    
     asyncio.run(
         run_automation(
             target_url=target_url,
@@ -238,7 +265,6 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             fallback_selectors=fallback_selectors,
         )
     )
-
 
 if __name__ == "__main__":
     main()
