@@ -17,8 +17,6 @@ from playwright.async_api import (
     async_playwright,
 )
 
-# Using .is or .li often works better as a base, but .ph is the main hub.
-# Redirects happen automatically.
 ARCHIVE_URL = "https://archive.ph/"
 
 @dataclass
@@ -30,14 +28,11 @@ class SubmissionResult:
 
 async def prompt_for_captcha_resolution(page: Page) -> None:
     """
-    Checks for common captcha/challenge indicators. If found, pauses execution
-    and waits for the user to solve it in the browser.
+    Checks for captcha frames. If found, pauses and alerts the user.
     """
-    # Common Cloudflare or Google Recaptcha frames/divs
     captcha_locators = [
         "iframe[src*='captcha']",
         "iframe[src*='turnstile']",
-        "iframe[src*='challenge']",
         "#cf-challenge-running", 
         "text='One more step'",
         "text='Verify you are human'"
@@ -46,8 +41,7 @@ async def prompt_for_captcha_resolution(page: Page) -> None:
     detected = False
     for locator in captcha_locators:
         try:
-            count = await page.locator(locator).count()
-            if count > 0:
+            if await page.locator(locator).count() > 0:
                 detected = True
                 break
         except Exception:
@@ -55,131 +49,107 @@ async def prompt_for_captcha_resolution(page: Page) -> None:
 
     if detected:
         print("\n" + "!" * 60)
-        print("CAPTCHA DETECTED!")
-        print("Please switch to the browser window, solve the puzzle,")
-        print("and wait for the page to load normally.")
+        print("CAPTCHA DETECTED! Please solve it in the opened browser window.")
         print("!" * 60 + "\n")
-        
-        # In a real GUI environment, we just wait for the user to press Enter in terminal
-        await asyncio.to_thread(input, ">> Press ENTER in this terminal AFTER solving the captcha... ")
-        
-        # Wait a moment for page to stabilize after user input
+        await asyncio.to_thread(input, ">> Press ENTER here AFTER you have solved the captcha... ")
         await page.wait_for_timeout(2000)
 
-async def handle_wip_page(page: Page, timeout: float) -> str:
+async def handle_wip_page(page: Page, timeout: float) -> Optional[str]:
     """
-    Archive.ph redirects to a /wip/ (work in progress) URL while processing.
-    We must wait for this to change to the final timestamped URL.
+    Waits for the 'Work In Progress' (/wip/) page to redirect to the final archive.
     """
-    print("Processing (WIP) page detected. Waiting for archive to finish...")
-    print("This can take 1-5 minutes. Please be patient.")
-
+    print("Page is processing (WIP). Waiting for final snapshot (this takes time)...")
     start_time = asyncio.get_running_loop().time()
     
     while True:
         current_url = page.url
-        
-        # If we are no longer on a WIP page and not on the home page, we are likely done
+        # If we are not on a WIP page, not on the home page, and not loading... we are done.
         if "/wip/" not in current_url and "submitid" not in current_url and current_url != ARCHIVE_URL:
-             # Double check: does the page look like a finished archive?
-             # Usually contains a header with the date or "share" buttons
-             return current_url
-
-        # Check for failure text
-        content = await page.content()
-        if "No results" in content and "search" in current_url:
-            return None # Search failed
-
+            return current_url
+        
+        # Check for timeout
         if (asyncio.get_running_loop().time() - start_time) > timeout:
-            print("Timeout waiting for WIP page to finish.")
-            return current_url # Return whatever we have
-
-        # Wait 2 seconds before checking again
+            print("Timeout waiting for processing to finish.")
+            return current_url
+        
         await asyncio.sleep(2)
 
 async def attempt_submission(
     context: BrowserContext,
     page: Page,
     url_value: str,
-    selectors: Sequence[str],
+    form_selector: str,  # The ID of the form (e.g., '#submiturl')
+    input_selector: str, # The selector for the input box inside that form
     timeout: float,
     label: str,
 ) -> SubmissionResult:
     starting_url = page.url
-
-    # Find a working selector
-    target_selector = None
-    for selector in selectors:
-        if await page.locator(selector).count() > 0:
-            target_selector = selector
-            break
     
-    if not target_selector:
-        return SubmissionResult(False, None, f"[{label}] No input box found.", page)
-
-    print(f"[{label}] Submitting via '{target_selector}'...")
+    # 1. Locate the Input Field
+    input_locator = page.locator(f"{form_selector} {input_selector}")
+    if await input_locator.count() == 0:
+        return SubmissionResult(False, None, f"Input box {input_selector} not found", page)
     
+    print(f"[{label}] Pasting URL into '{form_selector}'...")
     try:
-        target = page.locator(target_selector).first
-        await target.click()
-        await target.fill(url_value)
-        await target.press("Enter")
+        await input_locator.first.click()
+        await input_locator.first.fill(url_value)
     except Exception as e:
-        return SubmissionResult(False, None, f"Error interacting with page: {e}", page)
+        return SubmissionResult(False, None, f"Error filling input: {e}", page)
 
-    # 1. Wait for initial navigation (leaving the home page)
+    # 2. Locate and Click the Submit Button (CRITICAL FIX)
+    # We look for a submit input or button specifically inside the parent form
+    submit_btn = page.locator(f"{form_selector} input[type='submit']")
+    if await submit_btn.count() == 0:
+        submit_btn = page.locator(f"{form_selector} button")
+    
+    if await submit_btn.count() > 0:
+        print(f"[{label}] Clicking 'Save/Search' button...")
+        await submit_btn.first.click()
+    else:
+        print(f"[{label}] Button not found, trying Enter key...")
+        await input_locator.first.press("Enter")
+
+    # 3. Wait for Navigation
     try:
+        # Wait until URL changes from the starting URL
         await page.wait_for_url(lambda u: u != starting_url, timeout=15000)
     except PlaywrightTimeoutError:
-        print(f"[{label}] Timed out waiting for initial form submission.")
-        return SubmissionResult(False, None, "Form submission timeout", page)
+        print(f"[{label}] No navigation detected (Timeout).")
+        return SubmissionResult(False, None, "Navigation timeout", page)
 
-    # 2. Check for Captcha immediately after submission
+    # 4. Check for Captcha again after click
     await prompt_for_captcha_resolution(page)
 
-    # 3. Handle "WIP" (Loading) Phase
-    # Archive.ph often goes: Home -> WIP -> Final
+    # 5. Handle WIP / Processing Redirects
     if "/wip/" in page.url or "submitid" in page.url:
         final_url = await handle_wip_page(page, timeout)
         if final_url:
-            return SubmissionResult(True, final_url, "Archived successfully via WIP", page)
-        else:
-             return SubmissionResult(False, page.url, "WIP finished but no valid URL found", page)
+            return SubmissionResult(True, final_url, "Archived via WIP", page)
+    elif page.url != starting_url:
+        # Direct success
+        return SubmissionResult(True, page.url, "Direct success", page)
 
-    # 4. If we went straight to a result (rare but happens on cached hits)
-    await page.wait_for_load_state("domcontentloaded")
-    return SubmissionResult(True, page.url, "Direct navigation to result", page)
+    return SubmissionResult(False, None, "Unknown failure", page)
 
 
 def resolve_url_from_args_or_clipboard(provided: Optional[str]) -> str:
     if provided:
         return provided
-    
     if pyperclip:
-        url_from_clipboard = pyperclip.paste().strip()
-        if url_from_clipboard:
-            return url_from_clipboard
-            
-    print("Error: No URL provided and clipboard is empty (or pyperclip not installed).")
+        content = pyperclip.paste().strip()
+        if content:
+            return content
+    print("Error: No URL provided and clipboard is empty.")
     sys.exit(1)
 
-async def run_automation(
-    target_url: str,
-    timeout: float,
-    headless: bool,
-    primary_selectors: Sequence[str],
-    fallback_selectors: Sequence[str],
-) -> None:
-    
-    # Setup browser with anti-bot flags
+async def run_automation(target_url: str, timeout: float, headless: bool):
     async with async_playwright() as p:
-        # Launch options to make it look more 'human'
+        # Launch with anti-bot flags
         browser = await p.chromium.launch(
             headless=headless,
-            args=["--disable-blink-features=AutomationControlled"] 
+            args=["--disable-blink-features=AutomationControlled"]
         )
-        
-        # Use a generic User-Agent to avoid immediate blocking
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
@@ -188,83 +158,73 @@ async def run_automation(
         print(f"Opening {ARCHIVE_URL} ...")
         try:
             await page.goto(ARCHIVE_URL, timeout=30000)
-        except Exception as e:
-            print(f"Error loading {ARCHIVE_URL}: {e}")
+        except Exception:
+            print("Failed to load archive.ph homepage.")
             await browser.close()
             return
 
         await prompt_for_captcha_resolution(page)
 
-        # --- Attempt 1: New Archive (Red Box) ---
-        print("\n--- Attempting New Archive (Red Box) ---")
+        # --- Attempt 1: Red Box (Create New Archive) ---
+        # Form ID: #submiturl, Input name: url
         primary_result = await attempt_submission(
-            context, page, target_url, primary_selectors, timeout, label="primary"
+            context, page, target_url, 
+            form_selector="#submiturl", 
+            input_selector="input[name='url']", 
+            timeout=timeout, 
+            label="primary"
         )
 
         if primary_result.succeeded:
             print("\n" + "="*60)
-            print(f"SUCCESS! Archive URL: {primary_result.destination_url}")
+            print(f"RESULT: {primary_result.destination_url}")
             print("="*60 + "\n")
-            # Keep browser open briefly so user can see it if not headless
             if not headless:
-                print("Leaving browser open for 10 seconds to view result...")
-                await asyncio.sleep(10)
+                print("Closing in 5 seconds...")
+                await asyncio.sleep(5)
             await browser.close()
             return
 
-        # --- Attempt 2: Search Existing (Black Box) ---
-        print("\n--- Primary failed. Attempting Search (Black Box) ---")
+        # --- Attempt 2: Black Box (Search Existing) ---
+        print("\nPrimary attempt failed. Trying fallback (Search)...")
         
-        # Reload home
-        await page.goto(ARCHIVE_URL)
-        await prompt_for_captcha_resolution(page)
-
+        # Go back home if we aren't there
+        if "archive" not in page.url or "/wip/" in page.url:
+            await page.goto(ARCHIVE_URL)
+        
+        # Form ID: #searchurl, Input name: q (sometimes 'url', we try generic selector)
+        # Note: The input name in the black box is often 'q' or 'url' depending on the mirror.
+        # We use a generic input selector inside the form.
         fallback_result = await attempt_submission(
-            context, page, target_url, fallback_selectors, timeout, label="fallback"
+            context, page, target_url, 
+            form_selector="#searchurl", 
+            input_selector="input", 
+            timeout=timeout, 
+            label="fallback"
         )
 
         if fallback_result.succeeded:
             print("\n" + "="*60)
-            print(f"SUCCESS (Found Existing): {fallback_result.destination_url}")
+            print(f"RESULT (Found Existing): {fallback_result.destination_url}")
             print("="*60 + "\n")
-            if not headless:
-                await asyncio.sleep(10)
         else:
-            print("\nFAILED. Could not obtain a result URL.")
-            print(f"Last URL was: {fallback_result.destination_url}")
-
+            print("\nFAILED: Could not archive or find URL.")
+        
+        if not headless:
+            await asyncio.sleep(2)
         await browser.close()
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Automate archive.ph submission.")
-    parser.add_argument("url", nargs="?", help="URL to submit.")
-    
-    # Increased default timeout to 300s (5 mins) because archiving is slow
-    parser.add_argument("--timeout", type=float, default=300, help="Wait timeout in seconds.")
-    
-    # Default is HEADED (visible) because captchas are likely
-    parser.add_argument("--headless", action="store_true", help="Run invisible (not recommended).")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("url", nargs="?", help="URL to archive")
+    parser.add_argument("--timeout", type=float, default=300, help="Timeout in seconds")
+    parser.add_argument("--headless", action="store_true", help="Run without window")
     
     args = parser.parse_args()
     target_url = resolve_url_from_args_or_clipboard(args.url)
-
-    # Refined Selectors based on current archive.ph layout
-    # "submiturl" is the red box (create new), "searchurl" is the black box (find existing)
-    primary_selectors = ["#submiturl input[name='url']", "#url", "input[name='url']"]
-    fallback_selectors = ["#searchurl input[name='url']", "input[name='search']", "#search"]
-
-    print(f"Target URL: {target_url}")
     
-    asyncio.run(
-        run_automation(
-            target_url=target_url,
-            timeout=args.timeout,
-            headless=args.headless,
-            primary_selectors=primary_selectors,
-            fallback_selectors=fallback_selectors,
-        )
-    )
+    print(f"Target: {target_url}")
+    asyncio.run(run_automation(target_url, args.timeout, args.headless))
 
 if __name__ == "__main__":
     main()
